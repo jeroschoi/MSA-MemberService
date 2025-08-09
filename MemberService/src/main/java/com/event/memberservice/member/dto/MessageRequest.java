@@ -5,6 +5,7 @@ import lombok.*;
 
 @Getter
 @RequiredArgsConstructor
+@Builder
 public class MessageRequest {
 
     private final String userId;
