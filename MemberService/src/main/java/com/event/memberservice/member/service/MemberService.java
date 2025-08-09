@@ -3,14 +3,22 @@ package com.event.memberservice.member.service;
 import com.event.memberservice.member.dto.MemberJoinRequest;
 import com.event.memberservice.member.dto.MemberResponse;
 import com.event.memberservice.member.dto.MessageRequest;
+import com.event.memberservice.member.event.MemberExitedEvent;
+import com.event.memberservice.member.event.MemberJoinCompensateEvent;
+import com.event.memberservice.member.event.MessageSendFailedEvent;
 import com.event.memberservice.member.exception.MemberErrorCode;
 import com.event.memberservice.member.exception.MemberException;
 import com.event.memberservice.member.mapper.MemberMapper;
 import com.event.memberservice.member.repository.MemberRepository;
 import com.event.memberservice.member.repository.entity.MemberEntity;
+import com.event.memberservice.member.event.MemberJoinedEvent;
+
+
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
@@ -34,6 +42,8 @@ public class MemberService {
     // WebClient.Builder 대신, 미리 생성된 WebClient Bean을 직접 주입받습니다.
     private final WebClient messageWebClient;
 
+    private final ApplicationEventPublisher eventPublisher;
+
     private static final int MESSAGE_API_TIMEOUT_SECONDS = 3;
     private static final int MESSAGE_API_MAX_RETRY_COUNT = 2;
 
@@ -55,10 +65,20 @@ public class MemberService {
             // 비동기로 호출하고, 에러 발생 시 로그만 기록합니다.
             callMessageApi("/send-join", savedMember)
                     .subscribe(null, error -> log.error("회원가입 메시지 전송 실패 (비동기): {}", error.getMessage()));
+
+            eventPublisher.publishEvent(new MemberJoinedEvent(savedMember.getUserId(), savedMember.getEmail()));
+
             return memberMapper.toResponse(savedMember);
         } catch (DataIntegrityViolationException e) {
             log.error("회원가입 DB 제약조건 위배: userId={}", request.getUserId(), e);
+
+            eventPublisher.publishEvent(new MemberJoinCompensateEvent(request.getUserId(), "중복 데이터로 인한 롤백"));
+
             throw new MemberException(MemberErrorCode.DUPLICATE_USER_ID, "데이터 저장 중 중복이 발생했습니다.");
+        } catch (Exception e) {
+            // 일반 예외 발생 시에도 보상 이벤트 발행 가능
+            eventPublisher.publishEvent(new MemberJoinCompensateEvent(request.getUserId(), "기타 예외로 인한 롤백"));
+            throw e;
         }
     }
 
@@ -92,8 +112,13 @@ public class MemberService {
         memberEntity.setActive(false);
         memberEntity.setExitDate(LocalDateTime.now());
 
+        // DB 저장 (필요시 repository.save 호출 또는 JPA 영속성 컨텍스트에 맡김)
+        memberRepository.save(memberEntity);
+
         callMessageApi("/send-exit", memberEntity)
                 .subscribe(null, error -> log.error("회원탈퇴 메시지 전송 실패 (비동기): {}", error.getMessage()));
+
+        eventPublisher.publishEvent(new MemberExitedEvent(memberEntity.getUserId(), memberEntity.getEmail()));
     }
 
     /**
@@ -110,7 +135,11 @@ public class MemberService {
                 .bodyToMono(Void.class)
                 .timeout(Duration.ofSeconds(MESSAGE_API_TIMEOUT_SECONDS)) // 3초 타임아웃
                 .retry(MESSAGE_API_MAX_RETRY_COUNT) // 실패 시 2번 재시도
-                .doOnError(error -> log.error("메시지 API 호출 실패: userId={}, error={}", memberEntity.getUserId(), error.getMessage()));
+                .doOnError(error -> {
+                    log.error("메시지 API 호출 실패: userId={}, error={}", memberEntity.getUserId(), error.getMessage());
+                    eventPublisher.publishEvent(
+                            new MessageSendFailedEvent(memberEntity.getUserId(), endpoint, error.getMessage(), 0));
+                });
     }
 
     @Transactional(readOnly = true)
